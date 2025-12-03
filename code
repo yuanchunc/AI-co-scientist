@@ -1,0 +1,539 @@
+import asyncio
+import json
+import os
+import re
+import time
+import aiohttp
+from typing import Dict, List, Any, Optional
+from dataclasses import dataclass, field
+from datetime import datetime
+from bs4 import BeautifulSoup
+import PyPDF2
+
+# ==============================================================================
+# 0. 全局配置 (Configuration)
+# ==============================================================================
+
+API_CONFIG = {
+    "api_key": "",
+    "base_url": "https://api.pandalla.ai/v1/chat/completions",
+    "model": "gpt-4o",
+    "timeout": 60
+}
+
+# ==============================================================================
+# 1. 基础设施层 (Infrastructure)
+# ==============================================================================
+
+class AsyncLLMAPI:
+    """
+    异步大模型API调用封装
+ 
+    """
+    def __init__(self, config: Dict):
+        self.api_key = config["api_key"]
+        self.base_url = config["base_url"]
+        self.model = config["model"]
+        self.timeout = config["timeout"]
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+
+    async def call_api(self, system_prompt: str, user_content: str, json_mode: bool = False) -> str:
+        """异步调用 API"""
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            "temperature": 0.7,
+            "response_format": {"type": "json_object"} if json_mode else {"type": "text"}
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.base_url, 
+                    headers=self.headers, 
+                    json=payload, 
+                    timeout=self.timeout
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        print(f"[API Error] Status {response.status}: {error_text}")
+                        return "{}"
+                    
+                    result = await response.json()
+                    return result["choices"][0]["message"]["content"]
+        except Exception as e:
+            print(f"[Request Failed] {str(e)}")
+            return "{}"
+
+# ==============================================================================
+# 2. Prompt 管理层 (Prompt Engineering)
+# ==============================================================================
+
+class PromptManager:
+    """管理所有 Agent 的 System Prompts，严格对应文档要求"""
+    
+    @staticmethod
+    def get_dimension_prompts() -> Dict[str, str]:
+        return {
+            "Innovation": """你是一个专注于"创新与贡献"维度的商科论文评审专家。请根据以下 Rubric 对论文进行评分（1.00-5.00分）：
+【评分标准 - 创新性】
+- 1.00-1.99分 (无新意): 完全重复现有观点，无新理论或新方法。
+- 2.00-2.99分 (低创新): 仅对现有理论做微小修补，视角陈旧。
+- 3.00-3.99分 (中等): 在现有框架下有一定的新发现，或在新背景下应用旧理论。
+- 4.00-4.99分 (高创新): 提出了新的理论视角、模型或独特的方法论组合。
+- 5.00分 (颠覆性): 颠覆了传统认知，开创了新的研究领域或范式。
+【任务】
+1. 识别文章的核心贡献（New Theory/New Perspective/New Method）。
+2. 列出支持你评分的具体证据（引用原文片段）。
+3. 给出 1.00-5.00 的评分，精确到小数点后两位。
+【输出格式 JSON】
+{ "dimension": "innovation", "score": float, "reasoning": "...", "evidence": [...] }"""
+,
+
+            "Academic": """你是一个专注于"理论深度与学术严谨性"的评审专家。请根据以下 Rubric 对论文进行评分（1.00-5.00分）：
+【评分标准 - 理论深度】
+- 1.00-1.99分 (表浅): 缺乏理论基础，逻辑断裂，引用缺失。
+- 2.00-2.99分 (较弱): 理论引用堆砌，缺乏深度推导，存在逻辑漏洞。
+- 3.00-3.99分 (合格): 逻辑基本通顺，引用规范，但推导不够深入。
+- 4.00-4.99分 (深入): 理论框架扎实，推理严密，文献对话充分。
+- 5.00分 (极深): 理论洞察深刻，逻辑无懈可击，对学术界有重大启示。
+【任务】
+1. 审查引用的相关性与权威性。
+2. 检查假设提出的逻辑链条。
+3. 给出 1.00-5.00 的评分，精确到小数点后两位。
+【输出格式 JSON】
+{ "dimension": "theoretical_depth", "score": float, "reasoning": "...", "evidence": [...] }"""
+,
+
+            "Practicality": """你是一个拥有丰富行业经验的"实务评审专家"。请根据以下 Rubric 对论文进行评分（1.00-5.00分）：
+【评分标准 - 案例分析】
+- 1.00-1.99分 (无案例): 纯理论空谈，无任何实际数据或案例支持。
+- 2.00-2.99分 (薄弱): 案例陈旧或与理论脱节，缺乏实际指导意义。
+- 3.00-3.99分 (一般): 案例相关，但分析不够透彻，对管理者的启示有限。
+- 4.00-4.99分 (丰富): 案例详实，数据支持有力，对业界有较好参考价值。
+- 5.00分 (极佳): 案例极具代表性，分析切中痛点，能直接指导商业决策。
+【输出格式 JSON】
+{ "dimension": "practicality", "score": float, "reasoning": "...", "evidence": [...] }"""
+,
+
+            "Editor": """你是一个资深的"期刊责任编辑"。你的任务是评估文章的结构逻辑与表达清晰度。
+【评分标准 - 结构逻辑 & 表达】
+- 1.00-1.99分 (混乱/模糊): 结构支离破碎，语言晦涩难懂，术语错误。
+- 2.00-2.99分 (较差): 逻辑跳跃，段落衔接生硬，存在较多语病。
+- 3.00-3.99分 (清晰): 结构完整，语言通顺，无明显阅读障碍。
+- 4.00-4.99分 (优秀): 逻辑顺畅，层层递进，术语使用准确。
+- 5.00分 (完美): 结构精妙，文笔优美，具有极高的可读性与出版水准。
+【输出格式 JSON】
+{ "dimension": "structure_and_clarity", "score": float, "reasoning": "...", "evidence": [...] }"""
+        }
+
+    @staticmethod
+    def get_secretary_prompt() -> str:
+        return """你是评审委员会的秘书。你收到了四位专家（创新、学术、实务、编辑）针对同一篇论文的独立评分。
+【任务】
+1. **数据汇总**: 计算平均分，列出各维度的最高分和最低分。
+2. **分歧识别 (Conflict Detection)**: 
+   - 检查是否存在跨维度的显著矛盾（例如：创新Agent给5分，但学术Agent认为缺乏理论支撑给1分）。
+   - 检查专家引用的证据是否存在事实冲突。
+【输出格式 JSON】
+{
+  "summary_stats": {"average_score": float, ...},
+  "conflicts": ["冲突点1...", "冲突点2..."],
+  "consensus": "专家们一致认为..."
+}"""
+
+    @staticmethod
+    def get_eic_prompt() -> str:
+        return """你是具有最终决定权的资深主编。当前状态：四位评审专家已打分，秘书已整理出分歧点。
+【任务】
+1. **解决分歧**: 针对秘书提出的矛盾点，通过回查论文原文，给出你的最终判断。
+   - *思考链 (CoT)*: "专家A说X，专家B说Y，原文在第Z页写的是...因此专家A更准确。"
+2. **最终定级**: 给出 Accept / Minor Revision / Major Revision / Reject 的建议。
+3. **分数修正**: 如果你认为某位专家的评分有明显偏差，请修正该维度的最终得分并说明理由。
+【输出格式 JSON】
+{
+  "final_decision": "Major Revision",
+  "final_scores": {"innovation": 4, "theoretical": 2, ...},
+  "arbitration_logic": "虽然创新性强，但..."
+}"""
+
+    @staticmethod
+    def get_assistant_prompt() -> str:
+        return """根据主编的最终决定，撰写一份正式的《论文评审报告》。
+【要求】
+- 格式：Markdown
+- 语气：专业、客观、鼓励性
+- 结构必须包含：
+  1. **评审结论** (Executive Summary)
+  2. **维度得分概览** (Score Summary - 展示最终修正后的分数)
+  3. **详细优缺点分析** (Strengths & Weaknesses)
+  4. **关键分歧与仲裁结果** (Addressing Conflicts - 解释为何采用了某个观点)
+  5. **针对性修改建议** (Actionable Suggestions)"""
+
+# ==============================================================================
+# 3. Agent 实现层 (Agent Implementation)
+# ==============================================================================
+
+class BaseAgent:
+    def __init__(self, name: str, role: str, llm: AsyncLLMAPI):
+        self.name = name
+        self.role = role
+        self.llm = llm
+
+class ScoringAgent(BaseAgent):
+    """Layer 1: 维度评分 Agent"""
+    async def review(self, paper_content: str) -> Dict:
+        print(f"   >>> [{self.name}] 正在审阅论文...")
+        # 截取部分内容防止超长，实际场景建议使用 RAG
+        content_snippet = paper_content[:15000]
+        
+        response = await self.llm.call_api(self.role, f"Paper Content:\n{content_snippet}", json_mode=True)
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            print(f"   !!! [{self.name}] 输出格式错误，无法解析 JSON")
+            return {"dimension": self.name, "score": 0, "reasoning": "Error parsing output", "evidence": []}
+
+class SecretaryAgent(BaseAgent):
+    """Layer 2: 秘书 Agent (聚合)"""
+    async def aggregate(self, reviews: List[Dict]) -> Dict:
+        print(f"   >>> [{self.name}] 正在聚合 {len(reviews)} 份评审意见...")
+        reviews_str = json.dumps(reviews, ensure_ascii=False, indent=2)
+        response = await self.llm.call_api(self.role, f"Reviews:\n{reviews_str}", json_mode=True)
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            return {"summary_stats": {}, "conflicts": ["JSON Parse Error"], "consensus": ""}
+
+class EditorInChiefAgent(BaseAgent):
+    """Layer 2: 主编 Agent (仲裁)"""
+    async def arbitrate(self, paper_content: str, secretary_report: Dict) -> Dict:
+        print(f"   >>> [{self.name}] 正在进行最终仲裁 (System 2 Thinking)...")
+        content_snippet = paper_content[:5000] # 主编主要看摘要和引言+秘书报告
+        user_input = f"Paper Abstract/Intro:\n{content_snippet}\n\nSecretary Report:\n{json.dumps(secretary_report, ensure_ascii=False)}"
+        
+        response = await self.llm.call_api(self.role, user_input, json_mode=True)
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            return {"final_decision": "Error", "final_scores": {}, "arbitration_logic": "Error"}
+
+class PublicationAssistantAgent(BaseAgent):
+    """Layer 2: 出版助理 Agent (报告生成)"""
+    async def write_report(self, arbitration_result: Dict) -> str:
+        print(f"   >>> [{self.name}] 正在撰写最终报告...")
+        user_input = f"Arbitration Result:\n{json.dumps(arbitration_result, ensure_ascii=False)}"
+        return await self.llm.call_api(self.role, user_input, json_mode=False)
+
+# ==============================================================================
+# 4. 系统编排层 (Orchestrator)
+# ==============================================================================
+
+class MultiAgentReviewSystem:
+    def __init__(self, api_config: Dict):
+        self.llm = AsyncLLMAPI(api_config)
+        self.prompts = PromptManager()
+        
+        # 初始化 Layer 1 Agents
+        dimension_prompts = self.prompts.get_dimension_prompts()
+        self.scorers = [
+            ScoringAgent("Innovation Agent", dimension_prompts["Innovation"], self.llm),
+            ScoringAgent("Academic Agent", dimension_prompts["Academic"], self.llm),
+            ScoringAgent("Practicality Agent", dimension_prompts["Practicality"], self.llm),
+            ScoringAgent("Editor Agent", dimension_prompts["Editor"], self.llm)
+        ]
+        
+        # 初始化 Layer 2 Agents
+        self.secretary = SecretaryAgent("Secretary", self.prompts.get_secretary_prompt(), self.llm)
+        self.eic = EditorInChiefAgent("Editor-in-Chief", self.prompts.get_eic_prompt(), self.llm)
+        self.assistant = PublicationAssistantAgent("Assistant", self.prompts.get_assistant_prompt(), self.llm)
+        
+        # 存储所有文章的评分结果
+        self.all_scores = []
+
+    async def run_review(self, paper_title: str, paper_content: str, article_type: str = "普通文章"):
+        print("="*60)
+        print(f"启动多 Agent 评审流程: {paper_title} ({article_type})")
+        print("="*60)
+        
+        start_time = time.time()
+
+        # Step 1: 维度评分 (并行)
+        print("\n[Layer 1] 启动维度评分专家组 (Parallel Execution)...")
+        review_tasks = [agent.review(paper_content) for agent in self.scorers]
+        raw_reviews = await asyncio.gather(*review_tasks)
+        
+        # Step 2: 秘书聚合
+        print("\n[Layer 2.1] 秘书汇总与冲突检测...")
+        agg_report = await self.secretary.aggregate(raw_reviews)
+        print(f"   -> 发现分歧点: {len(agg_report.get('conflicts', []))} 个")
+
+        # Step 3: 主编仲裁
+        print("\n[Layer 2.2] 主编深度仲裁...")
+        final_decision = await self.eic.arbitrate(paper_content, agg_report)
+        print(f"   -> 最终决定: {final_decision.get('final_decision')}")
+
+        # Step 4: 生成报告
+        print("\n[Layer 2.3] 生成最终评审函...")
+        final_report_md = await self.assistant.write_report(final_decision)
+
+        duration = time.time() - start_time
+        print(f"\n[完成] 评审耗时: {duration:.2f} 秒")
+        
+        # 保存结果
+        filename = f"Review_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(f"# 评审报告: {paper_title} ({article_type})\n\n")
+            f.write(final_report_md)
+            f.write("\n\n---\n### 原始评分数据\n")
+            f.write("```json\n")
+            f.write(json.dumps(final_decision, indent=2, ensure_ascii=False))
+            f.write("\n```")
+        
+        # 保存评分结果到列表
+        self.all_scores.append({
+            "title": paper_title,
+            "type": article_type,
+            "scores": final_decision.get("final_scores", {}),
+            "decision": final_decision.get("final_decision", "Unknown")
+        })
+        
+        print(f"报告已保存至: {filename}")
+        print("\n------------------------------------------------------------")
+        print(final_report_md)
+        print("------------------------------------------------------------")
+        
+        return final_decision
+    
+    def save_comparison_report(self):
+        """生成并保存经典篇和普通篇的比较报告"""
+        if not self.all_scores:
+            print("没有评分数据可生成比较报告")
+            return
+        
+        # 分离经典篇和普通篇
+        classic_articles = [article for article in self.all_scores if article["type"] == "HBR经典"]
+        regular_articles = [article for article in self.all_scores if article["type"] == "普通文章"]
+        
+        # 计算平均分
+        def calculate_average(scores_list):
+            if not scores_list:
+                return {}
+            
+            dimensions = scores_list[0]["scores"].keys()
+            avg_scores = {}
+            
+            for dim in dimensions:
+                total = sum(article["scores"].get(dim, 0) for article in scores_list)
+                avg_scores[dim] = round(total / len(scores_list), 2)
+            
+            return avg_scores
+        
+        classic_avg = calculate_average(classic_articles)
+        regular_avg = calculate_average(regular_articles)
+        
+        # 生成比较报告
+        report = f"# HBR经典篇与普通篇评分比较报告\n\n"
+        report += f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        
+        report += "## 评分概览\n\n"
+        report += "| 文章类型 | 创新性 | 理论深度 | 实际应用价值 | 表达清晰度 | 文章数量 |\n"
+        report += "|---------|-------|---------|------------|-----------|---------|\n"
+        
+        # 格式化经典篇数据
+        classic_row = f"| HBR经典篇 | {classic_avg.get('innovation', 'N/A')} | {classic_avg.get('theoretical', 'N/A')} | {classic_avg.get('practicality', 'N/A')} | {classic_avg.get('clarity', 'N/A')} | {len(classic_articles)} |\n"
+        report += classic_row
+        
+        # 格式化普通篇数据
+        regular_row = f"| 普通文章 | {regular_avg.get('innovation', 'N/A')} | {regular_avg.get('theoretical', 'N/A')} | {regular_avg.get('practicality', 'N/A')} | {regular_avg.get('clarity', 'N/A')} | {len(regular_articles)} |\n"
+        report += regular_row
+        
+        # 计算差异
+        report += "\n## 维度差异分析\n\n"
+        dimensions = list(set(list(classic_avg.keys()) + list(regular_avg.keys())))
+        
+        for dim in dimensions:
+            classic_score = classic_avg.get(dim, 0)
+            regular_score = regular_avg.get(dim, 0)
+            diff = round(classic_score - regular_score, 2)
+            report += f"- **{dim}**: HBR经典篇 ({classic_score}) vs 普通文章 ({regular_score}) | 差异: {diff}\n"
+        
+        # 添加详细文章列表
+        report += "\n## 详细文章评分\n\n"
+        
+        # 经典篇详情
+        if classic_articles:
+            report += "### HBR经典篇\n\n"
+            for article in classic_articles:
+                scores = article["scores"]
+                report += f"#### {article['title']}\n\n"
+                report += "| 维度 | 评分 |\n"
+                report += "|-----|-----|\n"
+                for dim, score in scores.items():
+                    report += f"| {dim} | {score} |\n"
+                report += f"| 最终决定 | {article['decision']} |\n\n"
+        
+        # 普通篇详情
+        if regular_articles:
+            report += "### 普通文章\n\n"
+            for article in regular_articles[:10]:  # 只显示前10篇，避免报告过长
+                scores = article["scores"]
+                report += f"#### {article['title']}\n\n"
+                report += "| 维度 | 评分 |\n"
+                report += "|-----|-----|\n"
+                for dim, score in scores.items():
+                    report += f"| {dim} | {score} |\n"
+                report += f"| 最终决定 | {article['decision']} |\n\n"
+            
+            if len(regular_articles) > 10:
+                report += f"... 还有 {len(regular_articles) - 10} 篇普通文章未显示\n\n"
+        
+        # 保存报告
+        filename = f"Comparison_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(report)
+        
+        print(f"比较报告已保存至: {filename}")
+        return filename
+
+# 辅助函数：读取HBR经典文章
+def read_hbr_classic_articles(classic_folder_path):
+    """读取HBR经典30篇文件夹中的xhtml文件"""
+    articles = []
+    
+    try:
+        files = [f for f in os.listdir(classic_folder_path) if f.endswith('.xhtml')]
+        
+        for file in files:  # 处理所有经典文章
+            file_path = os.path.join(classic_folder_path, file)
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                    # 使用BeautifulSoup解析XHTML，提取纯文本
+                    soup = BeautifulSoup(content, 'lxml')
+                    text_content = soup.get_text(separator='\n', strip=True)
+                    # 尝试从内容中提取标题
+                    title_match = re.search(r'<title>(.*?)</title>', content, re.IGNORECASE)
+                    if title_match:
+                        title = title_match.group(1).strip()
+                    else:
+                        # 如果找不到标题标签，使用文件名作为备用
+                        title = file.replace('.xhtml', '').replace('_', ' ').title()
+                    articles.append((title, text_content))
+                    print(f"已读取经典文章: {title}")
+            except Exception as e:
+                print(f"读取文件 {file} 时出错: {str(e)}")
+    except Exception as e:
+        print(f"读取HBR经典文件夹时出错: {str(e)}")
+    
+    return articles
+
+# 辅助函数：读取PDF文章
+def read_pdf_article(file_path):
+    """从PDF文件中提取文本内容"""
+    try:
+        with open(file_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            text = []
+            for page_num in range(len(reader.pages)):
+                page = reader.pages[page_num]
+                text.append(page.extract_text())
+            return '\n'.join(text)
+    except Exception as e:
+        print(f"读取PDF文件时出错: {str(e)}")
+        return ""
+
+# 辅助函数：读取普通文章
+def read_regular_articles(folder_path):
+    """从文件夹中读取PDF格式的普通文章"""
+    articles = []
+    
+    try:
+        files = [f for f in os.listdir(folder_path) if f.endswith('.pdf')]
+        
+        for file in files:  # 处理所有普通文章
+            file_path = os.path.join(folder_path, file)
+            try:
+                # 从文件名提取标题（去除.pdf后缀并清理）
+                title = file.replace('.pdf', '')
+                # 替换下划线和连字符为空格
+                title = re.sub(r'[\-_]', ' ', title)
+                # 清理文件名中的特殊字符
+                title = re.sub(r'[^\w\s\u4e00-\u9fa5]', '', title)
+                title = title.strip()
+                
+                # 读取PDF内容
+                content = read_pdf_article(file_path)
+                if content.strip():
+                    articles.append((title, content))
+                    print(f"已读取普通文章: {title}")
+            except Exception as e:
+                print(f"读取文件 {file} 时出错: {str(e)}")
+    except Exception as e:
+        print(f"读取普通文章文件夹时出错: {str(e)}")
+    
+    return articles
+
+# ==============================================================================
+# 5. 测试入口
+# ==============================================================================
+
+async def main():
+    print("开始批量处理HBR经典篇和普通篇文章...")
+    
+    # 初始化系统
+    system = MultiAgentReviewSystem(API_CONFIG)
+    
+    # 1. 读取HBR经典文章
+    classic_folder_path = "./HBR经典30篇"
+    print(f"\n正在读取HBR经典文章 (路径: {classic_folder_path})...")
+    classic_articles = read_hbr_classic_articles(classic_folder_path)
+    print(f"成功读取 {len(classic_articles)} 篇经典文章")
+    
+    # 2. 读取普通文章
+    regular_folder_path = "./HBR_downloads"
+    print(f"\n正在读取普通文章 (路径: {regular_folder_path})...")
+    regular_articles = read_regular_articles(regular_folder_path)
+    print(f"成功读取 {len(regular_articles)} 篇普通文章")
+    
+    # 3. 对经典文章进行评审 - 处理所有文章
+    print("\n开始评审HBR经典文章...")
+    for i, (title, content) in enumerate(classic_articles):
+        print(f"\n[开始评审] {title} ({i+1}/{len(classic_articles)})")
+        await system.run_review(title, content, article_type="HBR经典")
+        # 添加延迟，避免API调用过于频繁
+        await asyncio.sleep(5)
+    
+    # 4. 对普通文章进行评审 - 处理所有文章
+    print("\n开始评审普通文章...")
+    for i, (title, content) in enumerate(regular_articles):
+        print(f"\n[开始评审] {title} ({i+1}/{len(regular_articles)})")
+        await system.run_review(title, content, article_type="普通文章")
+        # 添加延迟，避免API调用过于频繁
+        await asyncio.sleep(5)
+    
+    # 5. 生成比较报告
+    print("\n生成HBR经典篇与普通篇的比较报告...")
+    comparison_file = system.save_comparison_report()
+    print(f"比较报告已生成: {comparison_file}")
+    
+    print("\n所有任务完成!")
+
+if __name__ == "__main__":
+    # 检测环境并运行
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        print("检测到正在运行的事件循环（如 Jupyter），使用 create_task...")
+        asyncio.create_task(main())
+    else:
+        asyncio.run(main())
